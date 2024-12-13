@@ -1,0 +1,451 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+# Beam class definition
+class Beam:
+    def __init__(self, length, height, width):
+        self.length = length
+        self.height = height
+        self.width = width
+        self.I = (self.width * self.height**3) / 12  # Moment of inertia
+        self.origin = (0, 0, 0)  
+
+    def display_properties(self):
+        print(f"보의 길이: {self.length:.4f} m (x축 방향)")
+        print(f"보의 높이: {self.height:.4f} m (y축 방향)")
+        print(f"보의 폭: {self.width:.4f} m (z축 방향)")
+
+# Support class definition
+class Support:
+    def __init__(self, beam):
+        self.beam = beam
+        self.pin_positions = []
+        self.roller_positions = []
+        self.reactions = {}
+
+    def add_pin(self, x_position):
+        self.pin_positions.append((x_position, -self.beam.height / 2, 0))
+
+    def add_roller(self, x_position):
+        self.roller_positions.append((x_position, -self.beam.height / 2, 0))
+
+    def calculate_reactions(self, loads):
+        positions = self.pin_positions + self.roller_positions
+        total_supports = len(positions)
+        distances = [pos[0] for pos in positions]
+
+        total_vertical_load = sum(mag for pos, mag in loads.point_loads) + \
+                              sum(intensity * (end - start) for start, end, intensity in loads.distributed_loads)
+
+        moment_sum = sum(mag * (pos - distances[0]) for pos, mag in loads.point_loads) + \
+                     sum(moment for pos, moment in loads.point_moments) + \
+                     sum(intensity * (end - start) * ((start + end) / 2 - distances[0])
+                         for start, end, intensity in loads.distributed_loads)
+
+        reaction_matrix = [[0] * total_supports for _ in range(total_supports)]
+        load_vector = [0] * total_supports
+
+        for i in range(total_supports):
+            reaction_matrix[0][i] = 1
+        load_vector[0] = total_vertical_load
+
+        for i in range(total_supports):
+            reaction_matrix[1][i] = distances[i] - distances[0]
+        load_vector[1] = moment_sum
+
+        reactions = np.linalg.solve(reaction_matrix, load_vector)
+        for i, pos in enumerate(positions):
+            self.reactions[tuple(pos)] = reactions[i]
+
+        print("\n반력 계산 결과:")
+        for pos, reaction in self.reactions.items():
+            print(f"위치 {pos[0]:.4f} m에서 반력: {reaction:.4f} kN")
+
+# ExternalLoads class definition
+class ExternalLoads:
+    def __init__(self):
+        self.point_loads = []  # List of (position, magnitude)
+        self.point_moments = []  # List of (position, magnitude)
+        self.distributed_loads = []  # List of (start, end, intensity)
+
+    def add_point_load(self, position, magnitude):
+        self.point_loads.append((position, magnitude))
+
+    def add_point_moment(self, position, magnitude):
+        self.point_moments.append((position, magnitude))
+
+    def add_distributed_load(self, start, end, intensity):
+        self.distributed_loads.append((start, end, intensity))
+
+# Crack class definition
+class Crack:
+    def __init__(self):
+        self.cracks = []  # List of cracks (x, d)
+
+    def add_crack(self, x, d):
+        self.cracks.append({'x': x, 'd': d})
+
+    def display_cracks(self):
+        print("\n입력된 크랙 정보:")
+        for crack in self.cracks:
+            print(f"크랙 위치: {crack['x']} m, 깊이: {crack['d']} m")
+
+# InternalForces class definition
+class InternalForces:
+    def __init__(self, beam, support, loads):
+        self.beam = beam
+        self.support = support
+        self.loads = loads
+
+    def shear_force(self, x):
+        shear_force = 0
+        for support_pos, reaction in self.support.reactions.items():
+            if support_pos[0] < x:
+                shear_force += reaction
+
+        for start, end, intensity in self.loads.distributed_loads:
+            if start < x:
+                effective_length = min(x, end) - start
+                shear_force -= intensity * effective_length
+
+        for position, magnitude in self.loads.point_loads:
+            if position < x:
+                shear_force -= magnitude
+
+        return shear_force
+
+    def bending_moment(self, x):
+        bending_moment = 0
+        for support_pos, reaction in self.support.reactions.items():
+            if support_pos[0] < x:
+                bending_moment += reaction * (x - support_pos[0])
+
+        for start, end, intensity in self.loads.distributed_loads:
+            if start < x:
+                effective_length = min(x, end) - start
+                total_load = intensity * effective_length
+                load_position = start + effective_length / 2
+                bending_moment -= total_load * (x - load_position)
+
+        for position, magnitude in self.loads.point_loads:
+            if position < x:
+                bending_moment -= magnitude * (x - position)
+
+        for position, moment in self.loads.point_moments:
+            if position <= x:
+                bending_moment += moment  # 점모멘트의 부호 반영 수정 (반시계 방향일 때 +로 계산)
+
+        return bending_moment
+
+# StressTensor class definition
+class StressTensor:
+    def __init__(self, beam, internal_forces):
+        self.beam = beam
+        self.internal_forces = internal_forces
+        self.cracks = []
+
+    def add_crack(self, x_position, crack_depth):
+        self.cracks.append((x_position, crack_depth))
+
+    def calculate_neutral_axis_with_crack(self, x):
+        crack_depth = self.get_crack_at_position(x)
+        if crack_depth == 0:
+            self.neutral_axis = 0
+            return 0
+
+        remaining_height = self.beam.height - crack_depth
+        self.neutral_axis = self.beam.height/2 - remaining_height/2
+        return self.neutral_axis
+
+    def get_crack_at_position(self, x):
+        for crack_x, crack_depth in self.cracks:
+            if abs(crack_x - x) < 1e-6:
+                return crack_depth
+        return 0
+
+    def get_modified_I(self, x):
+        crack_depth = self.get_crack_at_position(x)
+        if crack_depth == 0:
+            return self.beam.I
+        remaining_height = self.beam.height - crack_depth
+        return (self.beam.width * remaining_height**3) / 12
+
+    def stress_tensor_with_crack(self, x, y, z, axial_force, moment, shear_force):
+        crack_depth = self.get_crack_at_position(x)
+        if crack_depth > 0:
+            neutral_axis = self.calculate_neutral_axis_with_crack(x)
+            if y <= -self.beam.height / 2 + crack_depth:
+                return [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+        else:
+            neutral_axis = 0
+
+        modified_I = self.get_modified_I(x)
+        y_from_neutral = y - self.neutral_axis if crack_depth > 0 else y
+
+        
+        sigma_xx = -(moment * y_from_neutral) / modified_I / 1000  # Convert to MPa
+
+        tau_xy = 0
+        if abs(y - self.beam.height / 2) < 1e-6:  # 최상단인 경우
+            tau_xy = 0
+        else:
+            if crack_depth == 0:  # 크랙이 없는 경우
+                height = self.beam.height / 2 - y
+                area = height * self.beam.width
+                centroid_y = y + height / 2
+                centroid_distance = abs(centroid_y)
+                Q = area * centroid_distance
+            else:  # 크랙이 있는 경우
+                if abs(y - neutral_axis) < 1e-6:
+                    area = 0.175
+                    centroid_distance = 0.175
+                    Q = area * centroid_distance
+                elif y < neutral_axis:
+                    height = (self.beam.height - crack_depth) / 2 - (neutral_axis - y)
+                    area = height * self.beam.width
+                    centroid_distance = 0.25
+                    Q = area * centroid_distance
+                else:
+                    height = self.beam.height / 2 - y
+                    area = height * self.beam.width
+                    centroid_y = y + height / 2
+                    centroid_distance = abs(centroid_y - neutral_axis)
+                    Q = area * centroid_distance
+
+            tau_xy = -(shear_force * Q) / (modified_I * self.beam.width) / 1000  # Convert to MPa
+
+
+        return [
+            [sigma_xx, tau_xy, 0],
+            [tau_xy, 0, 0],
+            [0, 0, 0]
+        ]
+
+    def calculate_principal_stresses(self, sigma_xx, tau_xy):
+        sigma_avg = sigma_xx / 2
+        radius = math.sqrt((sigma_xx / 2)**2 + tau_xy**2)
+        principal_stress_1 = sigma_avg + radius
+        principal_stress_2 = sigma_avg - radius
+        return principal_stress_1, principal_stress_2
+
+    def is_safe(self, sigma_xx, tau_xy, ultimate_tensile, ultimate_compressive, ultimate_shear):
+        sigma_avg = sigma_xx / 2
+        radius = math.sqrt((sigma_xx / 2)**2 + tau_xy**2)
+        principal_stress_1 = sigma_avg + radius
+        principal_stress_2 = sigma_avg - radius
+
+        if principal_stress_1 > ultimate_tensile or principal_stress_2 > ultimate_compressive or abs(tau_xy) > ultimate_shear:
+            return "불안전"
+        else:
+            return "안전"
+def calculate_principal_stresses(sigma_xx, tau_xy):
+    
+    sigma_avg = sigma_xx / 2
+    radius = math.sqrt((sigma_xx / 2)**2 + tau_xy**2)
+    principal_stress_1 = sigma_avg + radius
+    principal_stress_2 = sigma_avg - radius
+    return principal_stress_1, principal_stress_2
+
+def plot_failure_envelope_and_check_safety(ultimate_tensile, ultimate_compressive, ultimate_shear, sigma_xx, tau_xy):
+    fig, ax = plt.subplots()
+    tensile_circle = plt.Circle((ultimate_tensile / 2, 0), ultimate_tensile / 2, color='b', fill=False, linestyle='--', label='Tensile Mohr Circle')
+    compressive_circle = plt.Circle((-ultimate_compressive / 2, 0), ultimate_compressive / 2, color='g', fill=False, linestyle='--', label='Compressive Mohr Circle')
+    shear_circle = plt.Circle((0, 0), ultimate_shear, color='r', fill=False, linestyle='--', label='Shear Mohr Circle')
+
+    ax.add_artist(tensile_circle)
+    ax.add_artist(compressive_circle)
+    ax.add_artist(shear_circle)
+
+    ax.plot(sigma_xx, tau_xy, 'bo', label='Stress Point', markersize=8)
+
+    ax.set_xlim(-max(ultimate_compressive, ultimate_shear) * 1.5, max(ultimate_tensile, ultimate_shear) * 1.5)
+    ax.set_ylim(-max(ultimate_shear, ultimate_compressive) * 1.5, max(ultimate_shear, ultimate_tensile) * 1.5)
+    ax.set_xlabel('σ (MPa)')
+    ax.set_ylabel('τ (MPa)')
+    ax.set_title('Mohr\'s Failure Criterion')
+    ax.legend()
+
+    ax.grid(True)
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.show()
+
+    # Check if the stress point is within the safe zone
+    if (sigma_xx >= -ultimate_compressive and sigma_xx <= ultimate_tensile and
+        abs(tau_xy) <= ultimate_shear):
+        return "안전"
+    else:
+        return "불안전"
+
+def plot_stress_distribution(beam, internal_forces, x_values, y_values):
+    stress_distribution = []
+
+    for x in x_values:
+        stress_row = []
+        moment = internal_forces.bending_moment(x)
+        for y in y_values:
+            sigma_xx = -(moment * y) / beam.I / 1000  # Convert to MPa
+            stress_row.append(sigma_xx)
+        stress_distribution.append(stress_row)
+
+    stress_distribution = np.array(stress_distribution)
+
+    plt.figure()
+    plt.contourf(x_values, y_values, stress_distribution.T, levels=100, cmap='coolwarm')
+    plt.colorbar(label='Stress (MPa)')
+    plt.xlabel('Beam Length (m)')
+    plt.ylabel('Beam Height (m)')
+    plt.title('Stress Distribution in Beam')
+    plt.grid(True)
+    plt.show()
+
+def main():
+    print("보 설계 프로그램 시작")
+    length = float(input("보의 길이 (m): "))
+    height = float(input("보의 높이 (m): "))
+    width = float(input("보의 폭 (m): "))
+
+    beam = Beam(length, height, width)
+    beam.display_properties()
+
+    ultimate_tensile = float(input("재료의 극한 인장 강도 (σ_ut, MPa): "))
+    ultimate_compressive = float(input("재료의 극한 압축 강도 (σ_uc, MPa): "))
+    ultimate_shear = float(input("재료의 극한 전단 강도 (τ_us, MPa): "))
+
+    support = Support(beam)
+    loads = ExternalLoads()
+    crack = Crack()
+
+    # 지지 조건 추가
+    while True:
+        support_type = input("지지 조건 추가 (1: 핀, 2: 롤러, 3: 종료): ")
+        if support_type == '1':
+            x_position = float(input("핀 위치 (x 좌표, m): "))
+            support.add_pin(x_position)
+        elif support_type == '2':
+            x_position = float(input("롤러 위치 (x 좌표, m): "))
+            support.add_roller(x_position)
+        elif support_type == '3':
+            break
+
+    # 하중 추가
+    while True:
+        load_type = input("하중 추가 (1: 점하중, 2: 등분포 하중, 3: 점모멘트, 4: 종료): ")
+        if load_type == '1':
+            x = float(input("점하중 위치 (m): "))
+            mag = float(input("점하중 크기 (kN)(아래방향-양수): "))
+            loads.add_point_load(x, mag)
+        elif load_type == '2':
+            start = float(input("등분포 하중 시작 위치 (m): "))
+            end = float(input("등분포 하중 끝 위치 (m): "))
+            intensity = float(input("등분포 하중 크기 (kN/m)(아래방향-양수): "))
+            loads.add_distributed_load(start, end, intensity)
+        elif load_type == '3':
+            x = float(input("점모멘트 위치 (m): "))
+            moment = float(input("점모멘트 크기 (kN·m)(시계방향- 양수): "))
+            loads.add_point_moment(x, moment)
+        elif load_type == '4':
+            break
+
+    support.calculate_reactions(loads)
+    internal_forces = InternalForces(beam, support, loads)
+    stress_tensor_calculator = StressTensor(beam, internal_forces)
+
+    # 크랙 추가
+    while True:
+        crack_input = input("\n크랙 정보를 입력하시겠습니까? (y/n): ").strip().lower()
+        if crack_input == "y":
+            x_crack = float(input("크랙의 x 위치 (m)를 입력하세요: "))
+            crack_depth = float(input("크랙 깊이를 입력하세요 (m, 하단에서부터높이): "))
+            stress_tensor_calculator.add_crack(x_crack, crack_depth)
+        elif crack_input == "n":
+            break
+        else:
+            print("정확한 값을 입력하십시오.")
+
+
+    # 메뉴
+    while True:
+        print("\n[메뉴]")
+        print("1. 응력 텐서 계산")
+        print("2. SFD 출력")
+        print("3. BMD 출력")
+        print("4. 응력 분포도 출력")
+        print("5. 종료")
+        choice = input("선택: ")
+        if choice == '1':
+            x = float(input("x 위치 (m): "))
+            y = float(input("y 위치 (m): "))
+            z = float(input("z 위치 (m): "))
+
+            left_shear = internal_forces.shear_force(x - 1e-6)
+            right_shear = internal_forces.shear_force(x + 1e-6)
+            left_moment = internal_forces.bending_moment(x - 1e-6)
+            right_moment = internal_forces.bending_moment(x + 1e-6)
+
+            selected_shear = left_shear if abs(left_shear) > abs(right_shear) else right_shear
+            if abs(left_shear) == abs(right_shear):
+                selected_shear = max(left_shear, right_shear)
+
+            selected_moment = left_moment if abs(left_moment) > abs(right_moment) else right_moment
+            if abs(left_moment) == abs(right_moment):
+                selected_moment = max(left_moment, right_moment)
+
+            crack_depth = stress_tensor_calculator.get_crack_at_position(x)
+            if crack_depth > 0:
+                if y < -beam.height/2 + crack_depth:
+                    print(f"(크랙 발생한 지점)")
+                else:
+                    print(f"(크랙 발생하지 않은 지점)")
+            else:
+                print(f"\n(크랙 발생하지 않은 지점):")
+
+            tensor = stress_tensor_calculator.stress_tensor_with_crack(x, y, z, 0, selected_moment, selected_shear)
+            print("\n응력 텐서(MPa):")
+            for row in tensor:
+                print(["{:.4f}".format(value) for value in row])
+
+            sigma_xx = tensor[0][0]
+            tau_xy = tensor[0][1]
+            principal_stress_1, principal_stress_2 = calculate_principal_stresses(sigma_xx, tau_xy)
+            print(f"주응력 1: {principal_stress_1:.4f} MPa")
+            print(f"주응력 2: {principal_stress_2:.4f} MPa")
+
+            result = plot_failure_envelope_and_check_safety(
+                ultimate_tensile, ultimate_compressive, ultimate_shear, sigma_xx, tau_xy)
+
+            print(f"안전 상태: {result}")
+        elif choice == '2':
+            x_values = np.linspace(0, beam.length, 500)
+            shear_forces = [internal_forces.shear_force(x) for x in x_values]
+            plt.figure()
+            plt.plot(x_values, shear_forces, label='전단력 (SFD)')
+            plt.xlabel('보의 길이 (m)')
+            plt.ylabel('전단력 (kN)')
+            plt.title('전단력 분포도 (SFD)')
+            plt.grid(True)
+            plt.legend()
+            plt.show()
+        elif choice == '3':
+            x_values = np.linspace(0, beam.length, 500)
+            bending_moments = [internal_forces.bending_moment(x) for x in x_values]
+            plt.figure()
+            plt.plot(x_values, bending_moments, label='휨 모멘트 (BMD)', color='r')
+            plt.xlabel('보의 길이 (m)')
+            plt.ylabel('모멘트 (kN·m)')
+            plt.title('휨 모멘트 분포도 (BMD)')
+            plt.grid(True)
+            plt.legend()
+            plt.show()
+        elif choice == '4':
+            x_values = np.linspace(0, beam.length, 100)
+            y_values = np.linspace(-beam.height / 2, beam.height / 2, 50)
+            plot_stress_distribution(beam, internal_forces, x_values, y_values)
+        elif choice == '5':
+            print("프로그램 종료.")
+            break
+        else:
+            print("올바른 입력을 선택하세요.")
+
+if __name__ == "__main__":
+    main()
